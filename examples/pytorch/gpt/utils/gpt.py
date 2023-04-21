@@ -526,6 +526,8 @@ class GPT(nn.Module):
         except:
             print("[INFO] WARNING: Have initialized the process group")
         self.rank = dist.get_rank()
+        print(f'my rank is: {self.rank}, world_size: {dist.get_world_size()}')
+        #self.rank = 0
         self.device_count = torch.cuda.device_count()
         self.device = self.rank % self.device_count
         torch.cuda.set_device(self.device)
@@ -535,6 +537,8 @@ class GPT(nn.Module):
 
         self.tensor_para_rank = self.rank % self.tensor_para_size
         self.pipeline_para_rank = self.rank // self.tensor_para_size
+        #self.tensor_para_rank = self.rank
+        #self.pipeline_para_rank = self.rank
 
     def load(self, ckpt_path):
         is_load = self.weights.load(ckpt_path, tp_rank=self.tensor_para_rank,

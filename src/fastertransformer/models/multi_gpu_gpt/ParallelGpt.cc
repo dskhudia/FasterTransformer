@@ -1439,6 +1439,13 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
                             cache_indirections_[src_indir_idx] + id_offset * memory_len}},
                     {"local_batch_size", Tensor{MEMORY_CPU, TYPE_INT32, {1}, &tmp_local_batch_size}},
                     {"is_initialize_random_table", Tensor{MEMORY_CPU, TYPE_BOOL, {1}, &is_initialize_random_table}}};
+                //std::cout << "[Daya] logits " << std::endl;
+                //for (auto i = 0; i < batch_size; ++i) {
+                //std::cout << "[Daya] logits for batch: " << i << std::endl;
+                //for (auto v = 0; v < vocab_size_padded_; ++v) {
+                //std::cout << logits_buf_[i * vocab_size_padded_ + v] << std::endl;
+                //}
+                //}
 
                 for (auto t = input_tensors->begin(); t != input_tensors->end(); ++t) {
                     if (dynamic_decode_input_tensors.find(t->first) == dynamic_decode_input_tensors.end()) {

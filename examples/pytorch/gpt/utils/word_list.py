@@ -21,7 +21,7 @@ dir_path = os.path.dirname(os.path.realpath(__file__))
 base_path = dir_path + "/../../../.."
 sys.path.append(base_path)
 
-from examples.pytorch.gpt.utils import gpt_token_encoder as encoder
+from examples_ft.pytorch.gpt.utils import gpt_token_encoder as encoder
 
 
 def get_tokenizer(vocab_file=None, bpe_file=None):

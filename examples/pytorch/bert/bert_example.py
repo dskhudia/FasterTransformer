@@ -27,10 +27,10 @@ import numpy as np
 import random
 dir_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(dir_path + "/../../..")
-from examples.pytorch.utils import print_memory_usage
-from examples.pytorch.bert.utils.encoder import HuggingFaceEncoder
-from examples.pytorch.bert.utils.encoder import CustomEncoder
-from examples.pytorch.bert.utils.encoder import EncoderWeights
+from examples_ft.pytorch.utils import print_memory_usage
+from examples_ft.pytorch.bert.utils.encoder import HuggingFaceEncoder
+from examples_ft.pytorch.bert.utils.encoder import CustomEncoder
+from examples_ft.pytorch.bert.utils.encoder import EncoderWeights
 
 
 def sequence_mask(lengths, max_len=None, is_2d=True):
@@ -172,7 +172,7 @@ def bert_example(args):
         elif args['data_type'] == 'bf16':
             hf_encoder.bfloat16()
         hf_encoder.eval()
-        hf_encoder = torch.jit.trace(hf_encoder, (inp, mask))
+        hf_encoder = torch.jit.trace(hf_encoder, (inp, mask), strict=False)
 
     if args['int8_mode'] != 0:
         ft_weights.to_int8(args['sparse'], args['ths_path'])
@@ -202,7 +202,7 @@ def bert_example(args):
     with torch.no_grad():
         output_mask = sequence_mask(mem_seq_lens, args['seq_len']).to(mask.dtype).unsqueeze(-1)
         if rank == 0:
-            hf_output = hf_encoder(inp, mask)[0] * output_mask
+            hf_output = hf_encoder(inp, mask)['last_hidden_state'] * output_mask
             print(hf_output)
             print(hf_output.size())
 

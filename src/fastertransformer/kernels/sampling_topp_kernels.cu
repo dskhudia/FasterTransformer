@@ -1345,6 +1345,27 @@ addBiasSoftMax(T* logits, const T* bias, const int* end_ids, const bool* finishe
 }
 
 template<typename T>
+void printDevPtr(const T* d_cache, int len, char* name, bool print)
+{
+    T* res = (T*)malloc(sizeof(T) * len);
+    cudaMemcpy(res, d_cache, sizeof(T) * len, cudaMemcpyDeviceToHost);
+
+    printf("%s ", name);
+    int j = 0;
+    for (int i = 0; i < len; i++) {
+        if (res[i]) {
+            printf("%f ", (float)res[i]);
+            if (j % 20 == 19) {
+                printf("\n");
+            }
+        }
+        j = j + 1;
+    }
+    free(res);
+    printf("\n");
+}
+
+template<typename T>
 void invokeAddBiasSoftMax(T*           logits,
                           const T*     bias,
                           const int*   end_ids,
@@ -1356,6 +1377,9 @@ void invokeAddBiasSoftMax(T*           logits,
 {
     dim3 grid(m);
     dim3 block(min(n, 1024));
+    std::cout << "[daya] m is :" << m << std::endl;
+    std::cout << "[daya] n is :" << n << std::endl;
+    printDevPtr<T>(logits, n, "logits", true);
     /*n is the vocab_size, e.g., 30000, 7000.... vocab_size is usually very big. */
     addBiasSoftMax<<<grid, block, 0, stream>>>(logits, bias, end_ids, finished, n_padded, n);
 }

@@ -18,16 +18,17 @@ import configparser
 import os
 import sys
 import timeit
+import csv
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(dir_path, "../../.."))
-import examples.pytorch.gpt.utils.gpt_token_encoder as encoder
-from examples.pytorch.gpt.utils import comm
-from examples.pytorch.gpt.utils import gpt_decoder
-from examples.pytorch.gpt.utils.parallel_gpt import ParallelGPT
+import examples_ft.pytorch.gpt.utils.gpt_token_encoder as encoder
+from examples_ft.pytorch.gpt.utils import comm
+from examples_ft.pytorch.gpt.utils import gpt_decoder
+from examples_ft.pytorch.gpt.utils.parallel_gpt import ParallelGPT
 
 from utils import word_list
 
@@ -36,9 +37,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--layer_num', type=int, default=24,
                         help='number of layers')
-    parser.add_argument('--input_len', type=int, default=1,
+    parser.add_argument('--input_len', type=int, nargs='+', default=1,
                         help='input sequence length to generate.')
-    parser.add_argument('--output_len', type=int, default=32,
+    parser.add_argument('--output_len', type=int, nargs='+', default=32,
                         help='output sequence length to generate.')
     parser.add_argument('--head_num', type=int, default=16,
                         help='head number')
@@ -74,7 +75,7 @@ def main():
                         help='start token id.')
     parser.add_argument('--end_id', type=int, default=50256,
                         help='end token id.')
-    parser.add_argument('--max_batch_size', type=int, default=8,
+    parser.add_argument('--max_batch_size', type=int, nargs='+', default=8,
                         help='max batch size.')
     parser.add_argument('--repetition_penalty', type=float, default=1.,
                         help='repetition penalty')
@@ -91,6 +92,8 @@ def main():
                         help='path to sample input file. If not set, it runs with no context inputs.')
     parser.add_argument('--sample_output_file', type=str, default=None,
                         help='path to sample output file.')
+    parser.add_argument('--out_file', type=str, default="results.csv",
+                        help='path to timing results output file.')
     parser.add_argument('--enable_random_seed', action='store_true',
                         help='is use the random seed for sentences in a batch.')
     parser.add_argument('--skip_end_tokens', dest='skip_end_tokens', action='store_true',
@@ -216,30 +219,12 @@ def main():
         enc = encoder.get_encoder(args.vocab_file, args.merges_file)
     torch.manual_seed(0)
 
-    comm.initialize_model_parallel(args.tensor_para_size, args.pipeline_para_size)
+    comm.initialize_model_parallel(args.tensor_para_size, args.pipeline_para_size, backend=torch.distributed.Backend.MPI)
     rank = comm.get_rank()
     device = comm.get_device()
 
-    # Inputs
-    contexts = []
-    if args.sample_input_file:  # conditional case
-        with open(args.sample_input_file, "r") as f:
-            contexts = f.read().splitlines()
-            batch_size = min(len(contexts), max_batch_size)
-        contexts = contexts[:batch_size]
-        start_ids = [torch.tensor(enc.encode(c), dtype=torch.int32, device=device) for c in contexts]
-    else:  # unconditional case
-        batch_size = max_batch_size
-        contexts = ['<|endoftext|>'] * batch_size
-        start_ids = [torch.IntTensor([end_id for _ in range(args.input_len)])] * batch_size
-
-    start_lengths = [len(ids) for ids in start_ids]
-
-    start_ids = pad_sequence(start_ids, batch_first=True, padding_value=end_id)
-    start_lengths = torch.IntTensor(start_lengths)
-
-
     # Prepare model.
+                          #has_positional_encoding=False, use_attention_linear_bias=True,
     if not args.use_gpt_decoder_ops:
         gpt = ParallelGPT(head_num, size_per_head, vocab_size, start_id, end_id,
                           layer_num, max_seq_len, tensor_para_size, pipeline_para_size,
@@ -268,96 +253,135 @@ def main():
             int8_mode=args.int8_mode,
             weights_data_type=args.weights_data_type)
         gpt.load(args.ckpt_path, args.inference_data_type)
-
-    if args.enable_random_seed:
-        random_seed_tensor = torch.randint(0, 10000, size=[batch_size], dtype=torch.int64)
-    else:
-        random_seed_tensor = torch.zeros([batch_size], dtype=torch.int64)
-
-    bad_words_list=None
-    if args.banned_words:
-        batch_banned_words = args.banned_words.split("|")
-        banned_words = [[banned_words_for_batch] for banned_words_for_batch in batch_banned_words]
-        bad_words_list = torch.tensor(word_list.to_word_list_format(banned_words, enc)).to("cuda")
-
-    repetition_penalty_vec = None if repetition_penalty == 1. else repetition_penalty * torch.ones(batch_size, dtype=torch.float32)
-    presence_penalty_vec   = None if presence_penalty == 0. else presence_penalty * torch.ones(batch_size, dtype=torch.float32)
-
-    infer_decode_args = dict(
-        beam_width=beam_width,
-        top_k=top_k * torch.ones(batch_size, dtype=torch.int32),
-        top_p=top_p * torch.ones(batch_size, dtype=torch.float32),
-        temperature=temperature * torch.ones(batch_size, dtype=torch.float32),
-        repetition_penalty=repetition_penalty_vec,
-        presence_penalty=presence_penalty_vec,
-        beam_search_diversity_rate=beam_search_diversity_rate * torch.ones(batch_size, dtype=torch.float32),
-        len_penalty=len_penalty * torch.ones(size=[batch_size], dtype=torch.float32),
-        bad_words_list=bad_words_list,
-        min_length=min_length * torch.ones(size=[batch_size], dtype=torch.int32),
-        random_seed=random_seed_tensor
-    )
-
-    if not args.use_gpt_decoder_ops:
-        def gpt_generate_fn():
-            tokens_batch = gpt(start_ids,
-                               start_lengths,
-                               output_len,
-                               return_output_length=return_output_length,
-                               return_cum_log_probs=return_cum_log_probs,
-                               **infer_decode_args)
-            return tokens_batch
-    else:
-        def gpt_generate_fn():
-            output_dict = gpt.generate(input_token_ids=start_ids,
-                                       input_lengths=start_lengths,
-                                       gen_length=output_len,
-                                       eos_token_id=end_id,
-                                       return_output_length=return_output_length,
-                                       return_log_probs=return_cum_log_probs,
-                                       **infer_decode_args)
-            return output_dict
-
-    # Generate tokens.
-    gen_outputs = gpt_generate_fn()
-
+    fieldnames = [
+            'batch_size',
+            'input_len',
+            'output_len',
+            'latency_ms',
+        ]
     if rank == 0:
-        if not args.use_gpt_decoder_ops:
-            if return_cum_log_probs > 0:
-                tokens_batch, _, cum_log_probs = gen_outputs
-            else:
-                tokens_batch, cum_log_probs = gen_outputs, None
-        else:
-            tokens_batch = gen_outputs['output_token_ids']
-            cum_log_probs = gen_outputs['cum_log_probs'] if return_cum_log_probs > 0 else None
-        if cum_log_probs is not None:
-            print('[INFO] Log probs of sentences:', cum_log_probs)
+        f_out = open(args.out_file, 'w')
+        writer = csv.DictWriter(f_out, fieldnames=fieldnames)
+        writer.writeheader()
+    out_row = {i: None for i in fieldnames}
+    for batch_size in args.max_batch_size:
+        out_row['batch_size'] = batch_size
+        for input_len in args.input_len:
+            out_row['input_len'] = input_len
+            for output_len in args.output_len:
+                out_row['output_len'] = output_len 
+                if args.enable_random_seed:
+                    random_seed_tensor = torch.randint(0, 10000, size=[batch_size], dtype=torch.int64)
+                else:
+                    random_seed_tensor = torch.zeros([batch_size], dtype=torch.int64)
 
-        outputs = []
-        tokens_batch = tokens_batch.cpu().numpy()
-        for i, (context, tokens) in enumerate(zip(contexts, tokens_batch)):
-            for beam_id in range(beam_width):
-                token = tokens[beam_id][start_lengths[i]:]  # exclude context input from the output
-                if args.skip_end_tokens:
-                    token = token[token != end_id]
-                output = enc.decode(token) if args.detokenize else ' '.join(str(t) for t in token.tolist())
-                outputs.append(output)
-                print(f'[INFO] batch {i}, beam {beam_id}:\n[Context]\n{context}\n\n[Output]\n{output}\n')
+                bad_words_list=None
+                if args.banned_words:
+                    batch_banned_words = args.banned_words.split("|")
+                    banned_words = [[banned_words_for_batch] for banned_words_for_batch in batch_banned_words]
+                    bad_words_list = torch.tensor(word_list.to_word_list_format(banned_words, enc)).to("cuda")
 
-        if args.sample_output_file:
-            with open(args.sample_output_file, "w+") as f:
-                outputs = [o.replace("\n", "\\n") for o in outputs]
-                f.writelines("\n".join(outputs))
+                repetition_penalty_vec = None if repetition_penalty == 1. else repetition_penalty * torch.ones(batch_size, dtype=torch.float32)
+                presence_penalty_vec   = None if presence_penalty == 0. else presence_penalty * torch.ones(batch_size, dtype=torch.float32)
 
-    # Measure inference time.
-    if args.time:
-        iterations = 10
-        for _ in range(iterations):
-            gpt_generate_fn()
-        time = timeit.default_timer()
-        for _ in range(iterations):
-            gpt_generate_fn()
-        time_elapsed = timeit.default_timer() - time
-        print(f'[INFO] GPT time costs: {time_elapsed * 1000 / iterations:.2f} ms')
+                infer_decode_args = dict(
+                    beam_width=beam_width,
+                    top_k=top_k * torch.ones(batch_size, dtype=torch.int32),
+                    top_p=top_p * torch.ones(batch_size, dtype=torch.float32),
+                    temperature=temperature * torch.ones(batch_size, dtype=torch.float32),
+                    repetition_penalty=repetition_penalty_vec,
+                    presence_penalty=presence_penalty_vec,
+                    beam_search_diversity_rate=beam_search_diversity_rate * torch.ones(batch_size, dtype=torch.float32),
+                    len_penalty=len_penalty * torch.ones(size=[batch_size], dtype=torch.float32),
+                    bad_words_list=bad_words_list,
+                    min_length=min_length * torch.ones(size=[batch_size], dtype=torch.int32),
+                    random_seed=random_seed_tensor
+                )
+
+                # Inputs
+                contexts = []
+                if args.sample_input_file:  # conditional case
+                    with open(args.sample_input_file, "r") as f:
+                        contexts = f.read().splitlines()
+                        batch_size = min(len(contexts), max_batch_size)
+                    contexts = contexts[:batch_size]
+                    start_ids = [torch.tensor(enc.encode(c), dtype=torch.int32, device=device) for c in contexts]
+                else:  # unconditional case
+                    contexts = ['<|endoftext|>'] * batch_size
+                    start_ids = [torch.IntTensor([end_id for _ in range(input_len)])] * batch_size
+
+                start_lengths = [len(ids) for ids in start_ids]
+
+                start_ids = pad_sequence(start_ids, batch_first=True, padding_value=end_id)
+                print(f'input shape: {start_ids.shape}')
+                start_lengths = torch.IntTensor(start_lengths)
+
+                if not args.use_gpt_decoder_ops:
+                    def gpt_generate_fn():
+                        tokens_batch = gpt(start_ids,
+                                           start_lengths,
+                                           output_len,
+                                           return_output_length=return_output_length,
+                                           return_cum_log_probs=return_cum_log_probs,
+                                           **infer_decode_args)
+                        return tokens_batch
+                else:
+                    def gpt_generate_fn():
+                        output_dict = gpt.generate(input_token_ids=start_ids,
+                                                   input_lengths=start_lengths,
+                                                   gen_length=output_len,
+                                                   eos_token_id=end_id,
+                                                   return_output_length=return_output_length,
+                                                   return_log_probs=return_cum_log_probs,
+                                                   **infer_decode_args)
+                        return output_dict
+
+                # Generate tokens.
+                gen_outputs = gpt_generate_fn()
+
+                if rank == 0:
+                    if not args.use_gpt_decoder_ops:
+                        if return_cum_log_probs > 0:
+                            tokens_batch, _, cum_log_probs = gen_outputs
+                        else:
+                            tokens_batch, cum_log_probs = gen_outputs, None
+                    else:
+                        tokens_batch = gen_outputs['output_token_ids']
+                        cum_log_probs = gen_outputs['cum_log_probs'] if return_cum_log_probs > 0 else None
+                    if cum_log_probs is not None:
+                        print('[INFO] Log probs of sentences:', cum_log_probs)
+
+                    outputs = []
+                    tokens_batch = tokens_batch.cpu().numpy()
+                    print(f'output shape: {tokens_batch.shape}')
+                    for i, (context, tokens) in enumerate(zip(contexts, tokens_batch)):
+                        for beam_id in range(beam_width):
+                            token = tokens[beam_id][start_lengths[i]:]  # exclude context input from the output
+                            if args.skip_end_tokens:
+                                token = token[token != end_id]
+                            output = enc.decode(token) if args.detokenize else ' '.join(str(t) for t in token.tolist())
+                            outputs.append(output)
+                            print(f'[INFO] batch {i}, beam {beam_id}:\n[Context]\n{context}\n\n[Output]\n{output}\n')
+
+                    if args.sample_output_file:
+                        with open(args.sample_output_file, "w+") as f:
+                            outputs = [o.replace("\n", "\\n") for o in outputs]
+                            f.writelines("\n".join(outputs))
+
+                # Measure inference time.
+                if args.time:
+                    iterations = 10
+                    for _ in range(iterations):
+                        gpt_generate_fn()
+                    time = timeit.default_timer()
+                    for _ in range(iterations):
+                        gpt_generate_fn()
+                    time_elapsed = timeit.default_timer() - time
+                    latency_ms = time_elapsed * 1000 / iterations
+                    print(f'[INFO] GPT time costs: {time_elapsed * 1000 / iterations:.2f} ms')
+                    out_row['latency_ms'] = f'{latency_ms:.2f}'
+                    if rank == 0:
+                        writer.writerow(out_row)
 
 
 if __name__ == '__main__':
